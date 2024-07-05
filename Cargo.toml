@@ -13,6 +13,7 @@ rust-version = "1.63.0"
 
 [dependencies]
 image = "0.25"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 clipboard-win = { version = "5.3.1", features = ["monitor"] }
@@ -22,3 +23,16 @@ cocoa = "0.25.0"
 
 [target.'cfg(all(unix, not(any(target_os="macos", target_os="android", target_os="ios", target_os="emscripten"))))'.dependencies]
 x11rb = { version = "0.13.0", features = ["xfixes"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+tokio-yamux = "0.3"
+bytes = "1.6"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+flate2 = "1.0"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+async-trait = "0.1"

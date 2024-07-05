@@ -1,9 +1,12 @@
 use crate::{
-	common::{Result, RustImage},
+	common::{FilePasteHandler, Result, RustImage},
 	ClipboardContent, ClipboardHandler, ContentFormat, RustImageData,
 };
 use crate::{Clipboard, ClipboardWatcher};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+	mpsc::{self, Receiver, Sender},
+	Mutex,
+};
 use std::{
 	sync::{Arc, RwLock},
 	thread,
@@ -14,7 +17,7 @@ use x11rb::{
 	protocol::{
 		xfixes,
 		xproto::{
-			Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
+			Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, PropMode, Property,
 			SelectionNotifyEvent, SelectionRequestEvent, WindowClass, SELECTION_NOTIFY_EVENT,
 		},
 		Event,
@@ -58,10 +61,12 @@ x11rb::atom_manager! {
 }
 
 const FILE_PATH_PREFIX: &str = "file://";
+#[derive(Clone)]
 pub struct ClipboardContext {
 	inner: Arc<InnerContext>,
 }
 
+#[derive(Clone)]
 struct ClipboardData {
 	format: Atom,
 	data: Vec<u8>,
@@ -73,6 +78,7 @@ struct InnerContext {
 	ignore_formats: Vec<Atom>,
 	// 此刻待写入的剪贴板内容
 	wait_write_data: RwLock<Vec<ClipboardData>>,
+	last_owned_time: Mutex<Instant>,
 }
 
 impl InnerContext {
@@ -93,13 +99,19 @@ impl InnerContext {
 			server_for_write,
 			ignore_formats,
 			wait_write_data,
+			last_owned_time: Mutex::new(Instant::now()),
 		})
 	}
 
-	pub fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<()> {
+	pub fn handle_selection_request<T: FilePasteHandler>(
+		&self,
+		event: SelectionRequestEvent,
+		paste_handler: Option<&T>,
+	) -> Result<()> {
 		let success;
 		let ctx = &self.server_for_write;
 		let atoms = ctx.atoms;
+
 		// we are asked for a list of supported conversion targets
 		if event.target == atoms.TARGETS {
 			let reader = self.wait_write_data.read();
@@ -130,13 +142,70 @@ impl InnerContext {
 				Ok(data_list) => {
 					success = match data_list.iter().find(|d| d.format == event.target) {
 						Some(data) => {
+							let mut final_data = data.clone();
+
+							if let Some(handler) = paste_handler {
+								let Atoms {
+									FILE_LIST,
+									GNOME_COPY_FILES,
+									NAUTILUS_FILE_LIST,
+									..
+								} = atoms;
+
+								// Get the original file_list that want to paste.
+								let file_list_and_url_list_index = if FILE_LIST == data.format {
+									String::from_utf8(data.data.to_owned())?
+										.split('\n')
+										.map(|x| {
+											x.strip_prefix(FILE_PATH_PREFIX).map(ToOwned::to_owned)
+										})
+										.collect::<Option<Vec<_>>>()
+										.map(|x| (x, 0))
+								} else if [GNOME_COPY_FILES, NAUTILUS_FILE_LIST]
+									.contains(&data.format)
+								{
+									String::from_utf8(data.data.to_owned())?
+										.split('\n')
+										.skip(1)
+										.map(|x| {
+											x.strip_prefix(FILE_PATH_PREFIX).map(ToOwned::to_owned)
+										})
+										.collect::<Option<Vec<_>>>()
+										.map(|x| (x, 1))
+								} else {
+									None
+								};
+
+								// Call on_file_list_paste to replace original file_list with downloaded tmp file_list
+								let last = *self.last_owned_time.lock().unwrap();
+								if let Some((file_list, index)) = file_list_and_url_list_index {
+									if Instant::now().duration_since(last).as_millis() > 100 {
+										println!(
+                                            "event requestor: {}, target: {}, sequence: {}, time: {}, property: {}, response_type: {}, selection: {}",
+                                            event.requestor, event.target, event.sequence, event.time,event.property,event.response_type,event.selection
+                                        );
+										let new_file_list =
+											handler.on_file_list_paste(&file_list)?;
+										let new_datas =
+											file_uri_list_to_clipboard_data(new_file_list, atoms);
+										final_data = new_datas
+											.get(index)
+											.ok_or(
+												"The format of data to paste is file_list, \
+                                                    but failed to get file_list",
+											)?
+											.clone();
+									}
+								}
+							}
 							ctx.conn.change_property8(
 								PropMode::REPLACE,
 								event.requestor,
 								event.property,
 								event.target,
-								&data.data,
+								&final_data.data,
 							)?;
+
 							true
 						}
 						None => false,
@@ -145,6 +214,7 @@ impl InnerContext {
 				Err(_) => return Err("Failed to read clipboard data".into()),
 			}
 		}
+
 		// on failure, we notify the requester of it
 		let property = if success {
 			event.property
@@ -291,15 +361,36 @@ impl InnerContext {
 	}
 }
 
+impl FilePasteHandler for () {
+	fn on_file_list_paste(&self, _file_list: &[String]) -> Result<Vec<String>> {
+		unimplemented!()
+	}
+}
+
 impl ClipboardContext {
+	pub fn new_with_paste_handler<T: FilePasteHandler>(paste_handler: T) -> Result<Self> {
+		// build connection to X server
+		let ctx = InnerContext::new()?;
+		let ctx_arc = Arc::new(ctx);
+		let ctx_clone = ctx_arc.clone();
+
+		let _ = thread::spawn(move || {
+			let res = process_server_req(&ctx_clone, Some(paste_handler));
+			if let Err(e) = res {
+				println!("process_server_req error: {:?}", e);
+			}
+		});
+		Ok(Self { inner: ctx_arc })
+	}
+
 	pub fn new() -> Result<Self> {
 		// build connection to X server
 		let ctx = InnerContext::new()?;
 		let ctx_arc = Arc::new(ctx);
 		let ctx_clone = ctx_arc.clone();
 
-		thread::spawn(move || {
-			let res = process_server_req(&ctx_clone);
+		let _ = thread::spawn(move || {
+			let res = process_server_req(&ctx_clone, Option::<()>::None);
 			if let Err(e) = res {
 				println!("process_server_req error: {:?}", e);
 			}
@@ -351,21 +442,34 @@ impl ClipboardContext {
 			.set_selection_owner(win_id, clipboard, CURRENT_TIME)?
 			.check()?;
 
-		if ctx
-			.conn
-			.get_selection_owner(clipboard)?
-			.reply()
-			.map(|reply| reply.owner == win_id)
-			.unwrap_or(false)
-		{
+		if self.is_self_owner() {
+			*self.inner.last_owned_time.lock().unwrap() = Instant::now();
 			Ok(())
 		} else {
 			Err("Failed to take ownership of the clipboard".into())
 		}
 	}
+
+	fn is_self_owner(&self) -> bool {
+		let ctx = &self.inner.server_for_write;
+		let atoms = ctx.atoms;
+		let win_id = ctx.win_id;
+		let clipboard = atoms.CLIPBOARD;
+		ctx.conn
+			.get_selection_owner(clipboard)
+			.map_or(false, |reply| {
+				reply
+					.reply()
+					.map(|reply| reply.owner == win_id)
+					.unwrap_or(false)
+			})
+	}
 }
 
-fn process_server_req(context: &InnerContext) -> Result<()> {
+fn process_server_req<T: FilePasteHandler>(
+	context: &InnerContext,
+	paste_handler: Option<T>,
+) -> Result<()> {
 	let atoms = context.server_for_write.atoms;
 	loop {
 		match context
@@ -393,9 +497,10 @@ fn process_server_req(context: &InnerContext) -> Result<()> {
 				}
 			}
 			Event::SelectionRequest(event) => {
+				// event.requestor
 				// Someone is requesting the clipboard content from us.
 				context
-					.handle_selection_request(event)
+					.handle_selection_request(event, paste_handler.as_ref())
 					.map_err(|e| format!("handle_selection_request error: {:?}", e))?;
 			}
 			Event::SelectionNotify(event) => {
@@ -673,6 +778,7 @@ impl Clipboard for ClipboardContext {
 }
 
 pub struct ClipboardWatcherContext<T: ClipboardHandler> {
+	ctx: ClipboardContext,
 	handlers: Vec<T>,
 	stop_signal: Sender<()>,
 	stop_receiver: Receiver<()>,
@@ -681,13 +787,14 @@ pub struct ClipboardWatcherContext<T: ClipboardHandler> {
 unsafe impl<T: ClipboardHandler> Send for ClipboardWatcherContext<T> {}
 
 impl<T: ClipboardHandler> ClipboardWatcherContext<T> {
-	pub fn new() -> Result<Self> {
+	pub fn new(ctx: ClipboardContext) -> Self {
 		let (tx, rx) = mpsc::channel();
-		Ok(Self {
+		Self {
 			handlers: Vec::new(),
 			stop_signal: tx,
 			stop_receiver: rx,
-		})
+			ctx,
+		}
 	}
 }
 
@@ -739,9 +846,12 @@ impl<T: ClipboardHandler> ClipboardWatcher<T> for ClipboardWatcherContext<T> {
 				}
 			};
 			if let Event::XfixesSelectionNotify(_) = event {
-				self.handlers
-					.iter_mut()
-					.for_each(|handler| handler.on_clipboard_change());
+				self.handlers.iter_mut().for_each(|handler| {
+					// Only notify if self is not owner
+					if !self.ctx.is_self_owner() {
+						handler.on_clipboard_change();
+					}
+				});
 			}
 		}
 	}

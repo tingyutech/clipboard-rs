@@ -12,6 +12,11 @@ pub trait ContentData {
 	fn as_str(&self) -> Result<&str>;
 }
 
+pub trait FilePasteHandler: Send + Sync + 'static {
+	/// Handle system filelist paste and return new tmp filelist.
+	fn on_file_list_paste(&self, filelist: &[String]) -> Result<Vec<String>>;
+}
+
 pub trait ClipboardHandler {
 	fn on_clipboard_change(&mut self);
 }

@@ -1,6 +1,8 @@
 pub mod common;
 mod platform;
-pub use common::{ClipboardContent, ClipboardHandler, ContentFormat, Result, RustImageData};
+pub use common::{
+	ClipboardContent, ClipboardHandler, FilePasteHandler, ContentFormat, Result, RustImageData,
+};
 pub use image::imageops::FilterType;
 pub use platform::{ClipboardContext, ClipboardWatcherContext, WatcherShutdown};
 pub trait Clipboard: Send {
