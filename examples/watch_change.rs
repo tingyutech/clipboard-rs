@@ -9,6 +9,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use xxhash_rust::xxh32::xxh32;
 
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -43,7 +44,10 @@ struct ClipboardManager {
 
 impl ClipboardManager {
 	pub fn new(sender: Sender<Bytes>) -> Self {
+		#[cfg(unix)]
 		let ctx = ClipboardContext::new_with_paste_handler(FilePasteHandlerImpl).ok();
+		#[cfg(not(unix))]
+		let ctx = ClipboardContext::new().ok();
 		Self {
 			sender,
 			last_hash: 0,
@@ -125,6 +129,7 @@ impl ClipboardHandler for ClipboardManager {
 					}
 					Ok(file_list) => file_list,
 				};
+				println!("file_list:\n {file_list:#?}");
 
 				let file_list_json = serde_json::to_string_pretty(&file_list).unwrap();
 				let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -205,7 +210,10 @@ impl Clippy {
 
 	pub fn start_watch(&self) -> WatcherShutdown {
 		let ctx = self.clipboard_manager.ctx.clone().unwrap();
+		#[cfg(unix)]
 		let mut watcher = ClipboardWatcherContext::new(ctx);
+		#[cfg(not(unix))]
+		let mut watcher = ClipboardWatcherContext::new();
 		let watcher_shutdown = watcher
 			.add_handler(self.clipboard_manager.clone())
 			.get_shutdown_channel();
@@ -286,7 +294,24 @@ async fn main() {
 }
 
 mod file_list {
-	use std::{fs, os::unix::fs::MetadataExt, path::Path, time::UNIX_EPOCH};
+	#[cfg(unix)]
+	use std::os::unix::fs::MetadataExt;
+
+	use crate::file_time_to_date_time;
+
+	#[cfg(windows)]
+	use {
+		std::{
+			ffi::{OsStr, OsString},
+			os::windows::ffi::OsStrExt,
+		},
+		windows::core::PWSTR,
+		windows::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE},
+		windows::Win32::Storage::FileSystem::GetFileAttributesW,
+		windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
+	};
+
+	use std::{fs, path::Path, time::UNIX_EPOCH};
 
 	use anyhow::Context;
 	use chrono::{DateTime, Utc};
@@ -320,45 +345,60 @@ mod file_list {
 		pub fn new(uri: String) -> anyhow::Result<Self> {
 			let path = uri.trim_start_matches("file://").to_string();
 			let file_path = Path::new(&path);
-			let metadata = fs::metadata(file_path)?;
+			let metadata = fs::metadata(file_path.clone())?;
 
-			let (attributes, last_write_time, last_access_time) = if cfg!(windows) {
-				// use std::{
-				// 	ffi::{OsStr, OsString},
-				// 	os::windows::ffi::OsStrExt,
-				// };
-				// use windows::core::PWSTR;
-				// use windows::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
-				// use windows::Win32::Storage::FileSystem::GetFileAttributesW;
-				// unsafe {
-				// 	let mut windows_filename: Vec<u16> = OsStr::new(&path)
-				// 		.encode_wide()
-				// 		.chain(std::iter::once(0))
-				// 		.collect();
-				// 	let attributes = GetFileAttributesW(PWSTR(windows_filename.as_mut_ptr()));
-				// 	if attributes == INVALID_HANDLE_VALUE.0 as u32 {
-				// 		let error = GetLastError();
-				// 		anyhow::bail!("encounter error when getting attributes: {}", error.0);
-				// 	}
-				// 	(attributes, todo!(), todo!())
-				// }
-				todo!()
-			} else if cfg!(unix) {
+			#[cfg(windows)]
+			let (attributes, last_write_time, last_access_time) = unsafe {
+				let mut windows_filename: Vec<u16> = OsStr::new(&path)
+					.encode_wide()
+					.chain(std::iter::once(0))
+					.collect();
+
+				let attributes = GetFileAttributesW(PWSTR(windows_filename.as_mut_ptr()));
+				if attributes == INVALID_HANDLE_VALUE.0 as u32 {
+					let error = GetLastError();
+					anyhow::bail!("encounter error when getting attributes: {}", error.0);
+				}
+
+				let mut find_data: WIN32_FIND_DATAW = WIN32_FIND_DATAW::default();
+				let handle = FindFirstFileW(PWSTR(windows_filename.as_mut_ptr()), &mut find_data)?;
+				if handle == INVALID_HANDLE_VALUE {
+					let error = GetLastError();
+					anyhow::bail!("encounter error when finding file: {}", error.0);
+				}
+
+				let last_write_time = file_time_to_date_time(find_data.ftLastWriteTime)?;
+				let last_access_time = file_time_to_date_time(find_data.ftLastAccessTime)?;
+
+				FindClose(handle);
+
+				(attributes, last_write_time, last_access_time)
+			};
+
+			#[cfg(unix)]
+			let (attributes, last_write_time, last_access_time) = {
 				let attributes = if metadata.is_file() {
 					Attribute::Normal as u32
 				} else if metadata.is_dir() {
 					Attribute::Directory as u32
 				} else {
-					anyhow::bail!("{} is neither a file nor a directory", path);
+					anyhow::bail!("{} is neither a file nor a directory", path.display());
 				};
-				let last_write_time = DateTime::from_timestamp(metadata.mtime(), 0)
-					.context("Error convert mtime to DateTime")?;
-				let last_access_time = DateTime::from_timestamp(metadata.atime(), 0)
-					.context("Error convert atime to DateTime")?;
+				let last_write_time = DateTime::<Utc>::from_utc(
+					chrono::NaiveDateTime::from_timestamp(metadata.mtime(), 0),
+					Utc,
+				)
+				.context("Error converting mtime to DateTime")?;
+				let last_access_time = DateTime::<Utc>::from_utc(
+					chrono::NaiveDateTime::from_timestamp(metadata.atime(), 0),
+					Utc,
+				)
+				.context("Error converting atime to DateTime")?;
 				(attributes, last_write_time, last_access_time)
-			} else {
-				anyhow::bail!("Unsupported")
 			};
+
+			#[cfg(not(any(unix, windows)))]
+			anyhow::bail!("Unsupported platform");
 
 			let size = metadata.len();
 
@@ -368,7 +408,7 @@ mod file_list {
 
 			Ok(Self {
 				uri,
-				path,
+				path: file_path.file_name().unwrap().to_string_lossy().to_string(),
 				size,
 				attributes,
 				creation_time,
@@ -376,5 +416,33 @@ mod file_list {
 				last_write_time,
 			})
 		}
+	}
+}
+
+#[cfg(windows)]
+unsafe fn file_time_to_date_time(
+	file_time: windows::Win32::Foundation::FILETIME,
+) -> anyhow::Result<DateTime<Utc>> {
+	use windows::Win32::{
+		Foundation::{GetLastError, SYSTEMTIME},
+		System::Time::*,
+	};
+	let mut system_time: SYSTEMTIME = SYSTEMTIME::default();
+	if FileTimeToSystemTime(&file_time, &mut system_time).is_ok() {
+		let date = chrono::NaiveDate::from_ymd(
+			system_time.wYear as i32,
+			system_time.wMonth as u32,
+			system_time.wDay as u32,
+		);
+		let time = chrono::NaiveTime::from_hms(
+			system_time.wHour as u32,
+			system_time.wMinute as u32,
+			system_time.wSecond as u32,
+		);
+		let datetime = DateTime::<Utc>::from_utc(chrono::NaiveDateTime::new(date, time), Utc);
+		Ok(datetime)
+	} else {
+		let error = GetLastError();
+		anyhow::bail!("encounter error when converting file time: {}", error.0);
 	}
 }

@@ -24,6 +24,7 @@ static CF_RTF: &str = "Rich Text Format";
 static CF_HTML: &str = "HTML Format";
 static CF_PNG: &str = "PNG";
 
+#[derive(Clone)]
 pub struct ClipboardContext {
 	format_map: HashMap<&'static str, c_uint>,
 	html_format: formats::Html,
@@ -78,14 +79,14 @@ impl ClipboardContext {
 }
 
 impl<T: ClipboardHandler> ClipboardWatcherContext<T> {
-	pub fn new() -> Result<Self> {
+	pub fn new() -> Self {
 		let (tx, rx) = std::sync::mpsc::channel();
-		Ok(Self {
+		Self {
 			handlers: Vec::new(),
 			stop_signal: tx,
 			stop_receiver: rx,
 			running: false,
-		})
+		}
 	}
 }
 
